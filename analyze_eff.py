@@ -4,18 +4,18 @@ analyze_eff.py -- retrieve archived PV history with `arget` and plot it.
 
 Usage
 -----
-    analyze_eff.py                         # default PVs, 1-day history from yesterday
-    analyze_eff.py 2026-08-01              # default PVs, 2026-08-01 00:00 -> 2026-08-02 00:00
-    analyze_eff.py 2026-08-01 06:30:00     # default PVs, starting at given date+time (+1 day)
-    analyze_eff.py 2026-08-01 00:00:00 pv1 pv2 pv3   # custom PV list
+    analyze_eff.py                                         # default PVs, yesterday (1 day)
+    analyze_eff.py -s 2026-09-30                           # default PVs, 2026-09-30 -> +1 day
+    analyze_eff.py -s 2026-09-30 -e 2026-10-01            # explicit window, default PVs
+    analyze_eff.py -s 2026-09-30 -e 2026-10-01 --pvlist "pv1 pv2 pv3"
 
 Rules
 -----
-* First argument, if it looks like a date (YYYY-MM-DD), sets the start date.
-  A following HH:MM[:SS] token sets the start time (default 00:00:00).
-* If no date is given, the window defaults to *yesterday* 00:00:00.
-* The query window is always 1 day (start -> start + 24 h).
-* Any remaining arguments replace the default PV list.
+* -s/--start : window start.  Accepts "YYYY-MM-DD" or "YYYY-MM-DD HH:MM[:SS]".
+               Defaults to *yesterday* 00:00:00 when omitted.
+* -e/--end   : window end (same formats).  Defaults to start + 1 day.
+* --pvlist   : a single string of whitespace-separated PV names that replaces
+               the default PV list.  Defaults to the built-in DEFAULT_PVS.
 * Each PV is fetched with `arget`, written to a text file under an output
   directory named after the start date, then all PVs are plotted together.
 """
@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import shlex
+import argparse
 import subprocess
 from datetime import datetime, timedelta
 
@@ -46,27 +47,47 @@ TIME_RE = re.compile(r"^\d{1,2}:\d{2}(:\d{2})?$")
 
 
 # ------------------------------------------------------------- CLI parsing
-def parse_args(argv):
-    """Return (start_dt, pv_list) from the raw argument list."""
-    args = list(argv)
+def parse_datetime(text):
+    """Parse 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM[:SS]' into a datetime."""
+    text = text.strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    raise argparse.ArgumentTypeError(
+        "invalid date/time %r (use 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM[:SS]')" % text)
 
-    if args and DATE_RE.match(args[0]):
-        start_date = args.pop(0)
-        if args and TIME_RE.match(args[0]):
-            start_time = args.pop(0)
-            if start_time.count(":") == 1:
-                start_time += ":00"
-        else:
-            start_time = "00:00:00"
-        start_dt = datetime.strptime(start_date + " " + start_time,
-                                     "%Y-%m-%d %H:%M:%S")
+
+def parse_args(argv):
+    """Return (start_dt, end_dt, pv_list) from the raw argument list."""
+    p = argparse.ArgumentParser(
+        description="Retrieve archived PV history with arget and plot it.")
+    p.add_argument("-s", "--start",
+                   help="window start: 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM[:SS]' "
+                        "(default: yesterday 00:00:00)")
+    p.add_argument("-e", "--end",
+                   help="window end, same formats (default: start + 1 day)")
+    p.add_argument("--pvlist",
+                   help="whitespace-separated PV names in one string "
+                        "(default: built-in DEFAULT_PVS)")
+    args = p.parse_args(argv)
+
+    if args.start:
+        start_dt = parse_datetime(args.start)
     else:
-        # default: yesterday at midnight
         yesterday = datetime.now() - timedelta(days=1)
         start_dt = yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    pvs = args if args else list(DEFAULT_PVS)
-    return start_dt, pvs
+    end_dt = parse_datetime(args.end) if args.end else start_dt + timedelta(days=1)
+
+    if end_dt <= start_dt:
+        p.error("end (%s) must be after start (%s)" % (end_dt, start_dt))
+
+    pvs = args.pvlist.split() if args.pvlist else list(DEFAULT_PVS)
+    if not pvs:
+        p.error("--pvlist is empty")
+    return start_dt, end_dt, pvs
 
 
 # ------------------------------------------------------------- data fetch
@@ -156,8 +177,7 @@ def plot_all(pvs, series, start_dt, end_dt, outpng):
 
 # ------------------------------------------------------------- main
 def main():
-    start_dt, pvs = parse_args(sys.argv[1:])
-    end_dt = start_dt + timedelta(days=1)
+    start_dt, end_dt, pvs = parse_args(sys.argv[1:])
     start_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
     end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
 

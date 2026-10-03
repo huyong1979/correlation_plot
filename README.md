@@ -19,23 +19,29 @@ general-purpose PV history viewer.
 ## Usage
 
 ```bash
-analyze_eff.py                                   # default PVs, 1-day history from yesterday
-analyze_eff.py 2026-08-01                         # default PVs, 2026-08-01 00:00 -> 2026-08-02 00:00
-analyze_eff.py 2026-08-01 06:30:00                # default PVs, starting at given date+time (+1 day)
-analyze_eff.py 2026-08-01 00:00:00 pv1 pv2 pv3    # custom PV list over the same window
+analyze_eff.py                                            # default PVs, 1-day history from yesterday
+analyze_eff.py -s 2026-09-30                               # default PVs, 2026-09-30 00:00 -> +1 day
+analyze_eff.py -s 2026-09-30 -e 2026-10-01                # explicit window, default PVs
+analyze_eff.py -s 2026-09-30 -e 2026-10-01 --pvlist "pv1 pv2 pv3"   # custom PV list
 ```
 
 Make it executable first (`chmod +x analyze_eff.py`) or call it with
 `python3 analyze_eff.py ...`.
 
-### Argument rules
+### Options
 
-- The **first argument**, if it looks like a date (`YYYY-MM-DD`), sets the start
-  date. A following `HH:MM[:SS]` token sets the start time (default
-  `00:00:00`).
-- If **no date** is given, the window defaults to **yesterday** at `00:00:00`.
-- The query window is **always 1 day** (`start` → `start + 24 h`).
-- Any **remaining arguments** replace the default PV list.
+| Flag | Meaning | Default |
+|------|---------|---------|
+| `-s`, `--start` | Window start: `YYYY-MM-DD` or `YYYY-MM-DD HH:MM[:SS]` | yesterday `00:00:00` |
+| `-e`, `--end` | Window end, same formats | `start + 1 day` |
+| `--pvlist` | A single string of whitespace-separated PV names | built-in `DEFAULT_PVS` |
+
+Notes:
+
+- Start/end accept either a bare date or a date plus time; `--end` must be after
+  `--start`.
+- `--pvlist` takes **one quoted string**, e.g. `--pvlist "pv1 pv2 pv3"`; the
+  **first PV is treated as the efficiency signal** (see filtering below).
 
 ### Default PV list
 
@@ -57,8 +63,9 @@ given) containing:
 
 ## How it works
 
-1. **Parse arguments** (`parse_args`) — determine the start datetime and the PV
-   list following the rules above; the end time is always `start + 1 day`.
+1. **Parse arguments** (`parse_args`, using `argparse`) — determine the start and
+   end datetimes (`parse_datetime` accepts a bare date or date+time) and the PV
+   list; `--end` defaults to `start + 1 day`.
 2. **Fetch** (`fetch`) — for each PV, run
    `arget -T posix --no-enum -s <start> -e <end> <pv>` via `bash -lc` and write
    stdout to `<outdir>/<safe_pv_name>.txt`. PV names are sanitized into
@@ -80,16 +87,16 @@ given) containing:
 ## Example
 
 ```bash
-./analyze_eff.py 2026-08-01
+./analyze_eff.py -s 2026-09-30 -e 2026-10-01
 ```
 
 ```
-Window : 2026-08-01 00:00:00  ->  2026-08-02 00:00:00  (UTC)
-Output : 2026-08-01/
+Window : 2026-09-30 00:00:00  ->  2026-10-01 00:00:00  (UTC)
+Output : 2026-09-30/
 PVs    : 4
-  fetching INJ-BI{}Eff:BRInj-I   -> 2026-08-01/INJ_BI_Eff_BRInj_I.txt
-           dropped 4 glitch samples <= 10% (efficiency)
-           1107 samples
+  fetching INJ-BI{}Eff:BRInj-I   -> 2026-09-30/INJ_BI_Eff_BRInj_I.txt
+           dropped 36 glitch samples <= 10% (efficiency)
+           1260 samples
   ...
-Saved plot: 2026-08-01/history_plot.png
+Saved plot: 2026-09-30/history_plot.png
 ```
