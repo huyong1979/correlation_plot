@@ -1,30 +1,39 @@
 #!/usr/bin/env python3
 """
-analyze_eff.py -- retrieve archived PV history with `arget` and plot it.
+correlation_plot.py -- retrieve archived PV history with `arget`, plot each PV,
+and show the correlation of the 1st PV (Y) vs the 2nd PV (X).
 
 Usage
 -----
-    analyze_eff.py                                         # default PVs, yesterday (1 day)
-    analyze_eff.py -s 2026-09-30                           # default PVs, 2026-09-30 -> +1 day
-    analyze_eff.py -s 2026-09-30 -e 2026-10-01            # explicit window, default PVs
-    analyze_eff.py -s 2026-09-30 -e 2026-10-01 --pvlist "pv1 pv2 pv3"
+    correlation_plot.py                                    # defaults, yesterday (1 day)
+    correlation_plot.py -s 2026-09-30                      # defaults, 2026-09-30 -> +1 day
+    correlation_plot.py -s 2026-09-30 -e 2026-10-01        # explicit window, defaults
+    correlation_plot.py -s 2026-09-30 -e 2026-10-01 \\
+        --pv-configs '{"pv1": [10, 100], "pv2": [0, 1320]}' --corr-step 100
 
 Rules
 -----
-* -s/--start : window start.  Accepts "YYYY-MM-DD" or "YYYY-MM-DD HH:MM[:SS]".
-               Defaults to *yesterday* 00:00:00 when omitted.
-* -e/--end   : window end (same formats).  Defaults to start + 1 day.
-* --pvlist   : a single string of whitespace-separated PV names that replaces
-               the default PV list.  Defaults to the built-in DEFAULT_PVS.
+* -s/--start    : window start.  "YYYY-MM-DD" or "YYYY-MM-DD HH:MM[:SS]".
+                  Defaults to *yesterday* 00:00:00 when omitted.
+* -e/--end      : window end (same formats).  Defaults to start + 1 day.
+* --pv-configs  : a JSON object mapping each PV name to its valid value range
+                  [min, max].  Samples outside the range are dropped as glitches.
+                  Order matters: the 1st PV is the Y signal (e.g. efficiency) and
+                  the 2nd PV is the X signal (e.g. target bucket) of the
+                  correlation panel.  Defaults to DEFAULT_PV_CONFIGS.
+* --corr-step   : bin width (in X-PV units) for the correlation panel.
+                  Defaults to DEFAULT_CORR_STEP.
 * Each PV is fetched with `arget`, written to a text file under an output
   directory named after the start date, then all PVs are plotted together.
 """
 import os
 import re
 import sys
+import json
 import shlex
 import argparse
 import subprocess
+from collections import OrderedDict
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -35,12 +44,13 @@ import matplotlib.dates as mdates
 
 
 # ------------------------------------------------------------------ defaults
-DEFAULT_PVS = [
-    "INJ-BI{}Eff:BRInj-I",                      # Booster injection efficiency [%]
-    "ACC-TS{}Bucket-SP",                        # start of RF buckets to be filled
-    #"LN-TS{EVR:EGUN-Out:FP3}WfCalc:Width-SP",   # e-Gun pulser width -> bunch-train length
-    #"LN-TS{EVR:EGUN-Out:FP3}Ena-Sel",           # e-Gun pulse disable / enable
-]
+# Ordered mapping: PV name -> [min, max] valid range.
+# 1st entry = Y signal (efficiency), 2nd entry = X signal (target bucket).
+DEFAULT_PV_CONFIGS = OrderedDict([
+    ("INJ-BI{}Eff:BRInj-I", [10, 100]),   # Booster injection efficiency [%]
+    ("ACC-TS{}Bucket-SP", [0, 1320]),     # target bucket: start of RF buckets
+])
+DEFAULT_CORR_STEP = 100                    # correlation bin width (bucket units)
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 TIME_RE = re.compile(r"^\d{1,2}:\d{2}(:\d{2})?$")
@@ -60,17 +70,25 @@ def parse_datetime(text):
 
 
 def parse_args(argv):
-    """Return (start_dt, end_dt, pv_list) from the raw argument list."""
+    """Return (start_dt, end_dt, pv_configs, corr_step) from the argument list."""
     p = argparse.ArgumentParser(
-        description="Retrieve archived PV history with arget and plot it.")
+        description="Retrieve archived PV history with arget and plot "
+                    "correlations.")
     p.add_argument("-s", "--start",
                    help="window start: 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM[:SS]' "
                         "(default: yesterday 00:00:00)")
     p.add_argument("-e", "--end",
                    help="window end, same formats (default: start + 1 day)")
-    p.add_argument("--pvlist",
-                   help="whitespace-separated PV names in one string "
-                        "(default: built-in DEFAULT_PVS)")
+    p.add_argument("--pv-configs", dest="pv_configs",
+                   help='JSON dict mapping each PV name to its valid '
+                        '[min, max] range, e.g. '
+                        '\'{"pv1": [10, 100], "pv2": [0, 1320]}\'. '
+                        '1st PV = Y (efficiency), 2nd PV = X (bucket). '
+                        '(default: built-in DEFAULT_PV_CONFIGS)')
+    p.add_argument("--corr-step", dest="corr_step", type=float,
+                   default=DEFAULT_CORR_STEP,
+                   help="correlation bin width in X-PV units "
+                        "(default: %d)" % DEFAULT_CORR_STEP)
     args = p.parse_args(argv)
 
     if args.start:
@@ -84,10 +102,25 @@ def parse_args(argv):
     if end_dt <= start_dt:
         p.error("end (%s) must be after start (%s)" % (end_dt, start_dt))
 
-    pvs = args.pvlist.split() if args.pvlist else list(DEFAULT_PVS)
-    if not pvs:
-        p.error("--pvlist is empty")
-    return start_dt, end_dt, pvs
+    if args.pv_configs:
+        try:
+            pv_configs = json.loads(args.pv_configs,
+                                    object_pairs_hook=OrderedDict)
+        except ValueError as exc:
+            p.error("--pv-configs is not valid JSON: %s" % exc)
+        if not isinstance(pv_configs, dict) or not pv_configs:
+            p.error("--pv-configs must be a non-empty JSON object")
+        for pv, rng in pv_configs.items():
+            if (not isinstance(rng, (list, tuple)) or len(rng) != 2
+                    or rng[0] > rng[1]):
+                p.error("range for %r must be [min, max] with min <= max" % pv)
+    else:
+        pv_configs = OrderedDict(DEFAULT_PV_CONFIGS)
+
+    if args.corr_step <= 0:
+        p.error("--corr-step must be positive")
+
+    return start_dt, end_dt, pv_configs, args.corr_step
 
 
 # ------------------------------------------------------------- data fetch
@@ -146,30 +179,30 @@ def value_at(sig_t, sig_v, query_t):
     return sig_v[idx]
 
 
-def eff_vs_bucket(eff_t, eff_v, buc_t, buc_v, step=100):
-    """Average efficiency binned by target bucket (rounded to nearest `step`).
+def correlate_xy(y_t, y_v, x_t, x_v, step):
+    """Average Y binned by X (rounded to nearest `step`).
 
-    Returns (centers, mean_eff, std_eff, counts).
-    Each efficiency sample is paired with the target-bucket setpoint active at
-    that instant (zero-order hold), then grouped by bucket bin.
+    Returns (centers, mean_y, std_y, counts).
+    Each Y sample is paired with the X-signal value active at that instant
+    (zero-order hold), then grouped into bins of width `step`.
     """
-    buc_at_eff = value_at(buc_t, buc_v, eff_t)
-    groups = np.round(buc_at_eff / float(step)) * step
+    x_at_y = value_at(x_t, x_v, y_t)
+    groups = np.round(x_at_y / float(step)) * step
     centers = np.unique(groups[~np.isnan(groups)])
-    mean_eff, std_eff, counts = [], [], []
+    mean_y, std_y, counts = [], [], []
     for g in centers:
         sel = groups == g
-        mean_eff.append(eff_v[sel].mean())
-        std_eff.append(eff_v[sel].std())
+        mean_y.append(y_v[sel].mean())
+        std_y.append(y_v[sel].std())
         counts.append(int(np.sum(sel)))
-    return centers, np.array(mean_eff), np.array(std_eff), np.array(counts)
+    return centers, np.array(mean_y), np.array(std_y), np.array(counts)
 
 
-def plot_all(pvs, series, start_dt, end_dt, outpng):
+def plot_all(pvs, series, start_dt, end_dt, outpng, corr_step):
     n = len(pvs)
 
-    # Add a correlation panel (avg efficiency vs target bucket) when both the
-    # efficiency (PV #1) and target-bucket (PV #2) series carry data.
+    # Add a correlation panel (avg Y vs X) when both the Y signal (PV #1) and
+    # the X signal (PV #2) carry data.
     can_corr = (n >= 2 and len(series[pvs[0]][0]) and len(series[pvs[1]][0]))
     nrows = n + (1 if can_corr else 0)
 
@@ -212,23 +245,25 @@ def plot_all(pvs, series, start_dt, end_dt, outpng):
     axes[n - 1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
     plt.setp(axes[n - 1].get_xticklabels(), rotation=30, ha="right")
 
-    # ----- correlation panel: avg efficiency vs target bucket -----
+    # ----- correlation panel: avg Y (PV #1) vs X (PV #2) -----
     if can_corr:
         cax = axes[n]
-        eff_t, eff_v = series[pvs[0]]
-        buc_t, buc_v = series[pvs[1]]
-        centers, mean_eff, std_eff, counts = eff_vs_bucket(
-            eff_t, eff_v, buc_t, buc_v, step=100)
-        cax.errorbar(centers, mean_eff, yerr=std_eff, fmt="o-",
+        y_pv, x_pv = pvs[0], pvs[1]
+        y_t, y_v = series[y_pv]
+        x_t, x_v = series[x_pv]
+        centers, mean_y, std_y, counts = correlate_xy(
+            y_t, y_v, x_t, x_v, step=corr_step)
+        cax.errorbar(centers, mean_y, yerr=std_y, fmt="o-",
                      color="tab:red", ecolor="gray", elinewidth=0.8,
                      capsize=3, ms=5, lw=1.2)
-        cax.set_xlabel("Target Bucket  (start RF bucket)")
-        cax.set_ylabel("Avg Inj Eff\n[%]", fontsize=9)
+        cax.set_xlabel("%s  (binned, step=%g)" % (x_pv, corr_step))
+        cax.set_ylabel("Avg of\n%s" % y_pv, fontsize=8)
         cax.set_xticks(centers)
-        cax.set_xticklabels([("%d" % c) for c in centers], fontsize=7)
+        cax.set_xticklabels([("%g" % c) for c in centers], fontsize=7,
+                            rotation=45, ha="right")
         cax.grid(alpha=0.3)
-        cax.set_title("Booster injection efficiency vs Target Bucket "
-                      "(mean +/- std per 100-bucket bin)", fontsize=9)
+        cax.set_title("Correlation: mean +/- std of  %s  vs  %s  "
+                      "(per %g-wide bin)" % (y_pv, x_pv, corr_step), fontsize=9)
 
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     fig.savefig(outpng, dpi=130)
@@ -237,7 +272,7 @@ def plot_all(pvs, series, start_dt, end_dt, outpng):
 
 # ------------------------------------------------------------- main
 def main():
-    start_dt, end_dt, pvs = parse_args(sys.argv[1:])
+    start_dt, end_dt, pv_configs, corr_step = parse_args(sys.argv[1:])
     start_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
     end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -245,29 +280,33 @@ def main():
         else start_dt.strftime("%Y-%m-%d")
     os.makedirs(outdir, exist_ok=True)
 
-    print("Window : %s  ->  %s  (UTC)" % (start_str, end_str))
-    print("Output : %s/" % outdir)
-    print("PVs    : %d" % len(pvs))
+    pvs = list(pv_configs.keys())
+    print("Window    : %s  ->  %s  (UTC)" % (start_str, end_str))
+    print("Output    : %s/" % outdir)
+    print("PVs       : %d" % len(pvs))
+    print("Corr step : %g" % corr_step)
 
     series = {}
-    for i, pv in enumerate(pvs):
+    for pv in pvs:
+        lo, hi = pv_configs[pv]
         outfile = os.path.join(outdir, safe_name(pv) + ".txt")
         print("  fetching %-45s -> %s" % (pv, outfile))
         fetch(pv, start_str, end_str, outfile)
         t, v = load(outfile)
-        # The FIRST PV is the efficiency signal: keep only v > 10 %,
-        # anything <= 10 % is treated as a glitch and filtered out.
-        if i == 0 and len(v):
-            good = v > 10.0
+        # Range filter: keep only samples within the PV's [min, max] range;
+        # anything outside is treated as a glitch and dropped.
+        if len(v):
+            good = (v >= lo) & (v <= hi)
             n_bad = int(np.sum(~good))
             if n_bad:
-                print("           dropped %d glitch samples <= 10%% (efficiency)" % n_bad)
+                print("           dropped %d samples outside [%g, %g]"
+                      % (n_bad, lo, hi))
             t, v = t[good], v[good]
         series[pv] = (t, v)
         print("           %d samples" % len(t))
 
     outpng = os.path.join(outdir, "history_plot.png")
-    plot_all(pvs, series, start_dt, end_dt, outpng)
+    plot_all(pvs, series, start_dt, end_dt, outpng, corr_step)
 
 
 if __name__ == "__main__":
