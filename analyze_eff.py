@@ -38,8 +38,8 @@ import matplotlib.dates as mdates
 DEFAULT_PVS = [
     "INJ-BI{}Eff:BRInj-I",                      # Booster injection efficiency [%]
     "ACC-TS{}Bucket-SP",                        # start of RF buckets to be filled
-    "LN-TS{EVR:EGUN-Out:FP3}WfCalc:Width-SP",   # e-Gun pulser width -> bunch-train length
-    "LN-TS{EVR:EGUN-Out:FP3}Ena-Sel",           # e-Gun pulse disable / enable
+    #"LN-TS{EVR:EGUN-Out:FP3}WfCalc:Width-SP",   # e-Gun pulser width -> bunch-train length
+    #"LN-TS{EVR:EGUN-Out:FP3}Ena-Sel",           # e-Gun pulse disable / enable
 ]
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -137,19 +137,60 @@ def dt(arr):
     return [datetime.utcfromtimestamp(x) for x in arr]
 
 
+def value_at(sig_t, sig_v, query_t):
+    """Zero-order-hold: last known value of (sig_t, sig_v) at each query_t."""
+    if len(sig_t) == 0:
+        return np.full(len(query_t), np.nan)
+    idx = np.searchsorted(sig_t, query_t, side="right") - 1
+    idx = np.clip(idx, 0, len(sig_v) - 1)
+    return sig_v[idx]
+
+
+def eff_vs_bucket(eff_t, eff_v, buc_t, buc_v, step=100):
+    """Average efficiency binned by target bucket (rounded to nearest `step`).
+
+    Returns (centers, mean_eff, std_eff, counts).
+    Each efficiency sample is paired with the target-bucket setpoint active at
+    that instant (zero-order hold), then grouped by bucket bin.
+    """
+    buc_at_eff = value_at(buc_t, buc_v, eff_t)
+    groups = np.round(buc_at_eff / float(step)) * step
+    centers = np.unique(groups[~np.isnan(groups)])
+    mean_eff, std_eff, counts = [], [], []
+    for g in centers:
+        sel = groups == g
+        mean_eff.append(eff_v[sel].mean())
+        std_eff.append(eff_v[sel].std())
+        counts.append(int(np.sum(sel)))
+    return centers, np.array(mean_eff), np.array(std_eff), np.array(counts)
+
+
 def plot_all(pvs, series, start_dt, end_dt, outpng):
     n = len(pvs)
-    fig, axes = plt.subplots(n, 1, figsize=(15, max(2.4 * n, 3)),
-                             sharex=True, squeeze=False)
+
+    # Add a correlation panel (avg efficiency vs target bucket) when both the
+    # efficiency (PV #1) and target-bucket (PV #2) series carry data.
+    can_corr = (n >= 2 and len(series[pvs[0]][0]) and len(series[pvs[1]][0]))
+    nrows = n + (1 if can_corr else 0)
+
+    fig, axes = plt.subplots(nrows, 1, figsize=(15, max(2.4 * nrows, 3)),
+                             squeeze=False)
     axes = axes[:, 0]
     colors = plt.get_cmap("tab10").colors
+
+    # share the time (x) axis across the first n time-history panels only
+    for ax in axes[1:n]:
+        axes[0].get_shared_x_axes().join(axes[0], ax)
+    for ax in axes[:n - 1]:
+        plt.setp(ax.get_xticklabels(), visible=False)
 
     fig.suptitle("PV history   %s  ->  %s  (UTC)"
                  % (start_dt.strftime("%Y-%m-%d %H:%M"),
                     end_dt.strftime("%Y-%m-%d %H:%M")),
                  fontsize=13, fontweight="bold")
 
-    for i, (pv, ax) in enumerate(zip(pvs, axes)):
+    for i, pv in enumerate(pvs):
+        ax = axes[i]
         t, v = series[pv]
         color = colors[i % len(colors)]
         if len(t):
@@ -167,9 +208,28 @@ def plot_all(pvs, series, start_dt, end_dt, outpng):
         ax.set_ylabel(pv, fontsize=8, rotation=0, ha="right", va="center")
         ax.grid(alpha=0.3)
 
-    axes[-1].set_xlabel("UTC time")
-    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-    fig.autofmt_xdate()
+    axes[n - 1].set_xlabel("UTC time")
+    axes[n - 1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    plt.setp(axes[n - 1].get_xticklabels(), rotation=30, ha="right")
+
+    # ----- correlation panel: avg efficiency vs target bucket -----
+    if can_corr:
+        cax = axes[n]
+        eff_t, eff_v = series[pvs[0]]
+        buc_t, buc_v = series[pvs[1]]
+        centers, mean_eff, std_eff, counts = eff_vs_bucket(
+            eff_t, eff_v, buc_t, buc_v, step=100)
+        cax.errorbar(centers, mean_eff, yerr=std_eff, fmt="o-",
+                     color="tab:red", ecolor="gray", elinewidth=0.8,
+                     capsize=3, ms=5, lw=1.2)
+        cax.set_xlabel("Target Bucket  (start RF bucket)")
+        cax.set_ylabel("Avg Inj Eff\n[%]", fontsize=9)
+        cax.set_xticks(centers)
+        cax.set_xticklabels([("%d" % c) for c in centers], fontsize=7)
+        cax.grid(alpha=0.3)
+        cax.set_title("Booster injection efficiency vs Target Bucket "
+                      "(mean +/- std per 100-bucket bin)", fontsize=9)
+
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     fig.savefig(outpng, dpi=130)
     print("Saved plot: %s" % outpng)

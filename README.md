@@ -48,9 +48,11 @@ Notes:
 | # | PV | Meaning |
 |---|----|---------|
 | 1 | `INJ-BI{}Eff:BRInj-I` | Booster injection efficiency [%] |
-| 2 | `ACC-TS{}Bucket-SP` | Start of RF buckets to be filled |
-| 3 | `LN-TS{EVR:EGUN-Out:FP3}WfCalc:Width-SP` | e-Gun pulser width → bunch-train length |
-| 4 | `LN-TS{EVR:EGUN-Out:FP3}Ena-Sel` | e-Gun pulse disable / enable |
+| 2 | `ACC-TS{}Bucket-SP` | Target bucket: start of RF buckets to be filled |
+
+The **first PV is the efficiency signal** and the **second PV is the target
+bucket**; this ordering drives the glitch filtering and the correlation panel
+(see below).
 
 ## Output
 
@@ -59,7 +61,8 @@ the start (`YYYY-MM-DD`, or `YYYY-MM-DD_HHMMSS` when a non-midnight start time i
 given) containing:
 
 - one `*.txt` file per PV with the raw `arget` output (posix timestamps), and
-- `history_plot.png` — a stacked plot with one panel per PV.
+- `history_plot.png` — a stacked plot with one time-history panel per PV, plus a
+  final **efficiency-vs-target-bucket** panel when at least two PVs are present.
 
 ## How it works
 
@@ -78,11 +81,18 @@ given) containing:
    `<= 10 %` (including archiver sentinel/invalid values such as negative
    numbers) is treated as a glitch and dropped. All other PVs are left
    untouched.
-5. **Plot** (`plot_all`) — draw one panel per PV sharing the time (UTC) axis,
-   using a zero-order-hold (`steps-post`) line that matches how the archiver
-   stores values. Each panel shows a small statistics box (`N`, `max`, `min`,
-   `ave`, `std`); a panel with no data is annotated accordingly. The figure is
-   saved to `history_plot.png`.
+5. **Plot** (`plot_all`) — draw one time-history panel per PV sharing the time
+   (UTC) axis, using a zero-order-hold (`steps-post`) line that matches how the
+   archiver stores values. Each panel shows a small statistics box (`N`, `max`,
+   `min`, `ave`, `std`); a panel with no data is annotated accordingly.
+6. **Correlation panel** (`eff_vs_bucket`) — when both the efficiency (PV #1) and
+   the target bucket (PV #2) carry data, a final panel plots **average injection
+   efficiency vs target bucket**. Each efficiency sample is paired with the
+   target-bucket setpoint active at that instant (zero-order hold, `value_at`),
+   the bucket is rounded to the nearest 100 (bins `0, 100, …, ~1300`), and the
+   mean ± std efficiency is drawn for each bin. This reveals whether injection
+   efficiency depends on the target bucket. The figure is saved to
+   `history_plot.png`.
 
 ## Example
 
